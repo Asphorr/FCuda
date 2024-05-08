@@ -11,7 +11,7 @@ def load_cuda_kernels():
         int index = blockIdx.x * blockDim.x + threadIdx.x;
         if (index < size) {
             float x = data[index];
-            data[index] = 1.0 / (1.0 + exp(-x));
+            data[index] = 1.0 / (1.0 + expf(-x));
         }
     }
 
@@ -19,22 +19,37 @@ def load_cuda_kernels():
     void optimized_conv2d(float* __restrict__ output, const float* __restrict__ input,
                           const float* __restrict__ weight, int B, int C, int H, int W,
                           int K, int outC, int outH, int outW) {
-        // Naive implementation for demonstration, can be optimized further
+        // Improved implementation using shared memory and loop unrolling
         int OW = blockIdx.x * blockDim.x + threadIdx.x;
         int OH = blockIdx.y * blockDim.y + threadIdx.y;
-        int OB = blockIdx.z * blockDim.z + threadIdx.z;
+        int OB = blockIdx.z;
+
+        extern __shared__ float shared_data[];
+        float* shared_input = &shared_data[0];
+        float* shared_weight = &shared_data[blockDim.x * blockDim.y];
 
         if (OW < outW && OH < outH && OB < B) {
             for (int oc = 0; oc < outC; oc++) {
-                float value = 0;
-                for (int c = 0; c < C; c++) {
-                    for (int kh = 0; kh < K; kh++) {
-                        for (int kw = 0; kw < K; kw++) {
+                float value = 0.0f;
+
+                // Load weights into shared memory
+                for (int c = 0; c < C; ++c) {
+                    for (int kh = 0; kh < K; ++kh) {
+                        for (int kw = 0; kw < K; ++kw) {
+                            shared_weight[(c * K + kh) * K + kw] = weight[(oc * C + c) * K * K + kh * K + kw];
+                        }
+                    }
+                }
+                __syncthreads();
+
+                for (int c = 0; c < C; ++c) {
+                    for (int kh = 0; kh < K; ++kh) {
+                        for (int kw = 0; kw < K; ++kw) {
                             int IH = OH + kh - K / 2;
                             int IW = OW + kw - K / 2;
                             if (IH >= 0 && IH < H && IW >= 0 && IW < W) {
                                 value += input[OB * C * H * W + c * H * W + IH * W + IW] *
-                                         weight[oc * C * K * K + c * K * K + kh * K + kw];
+                                         shared_weight[(c * K + kh) * K + kw];
                             }
                         }
                     }
@@ -86,10 +101,12 @@ class OptimizedConv2dCUDA(nn.Module):
         blocks_per_grid = (
             (outW + threads_per_block[0] - 1) // threads_per_block[0],
             (outH + threads_per_block[1] - 1) // threads_per_block[1],
-            (B + threads_per_block[2] - 1) // threads_per_block[2]
+            B
         )
         
-        cuda_kernels.optimized_conv2d[blocks_per_grid, threads_per_block](
+        shared_memory_size = (threads_per_block[0] * threads_per_block[1] * sizeof(float)) + (self.in_channels * self.kernel_size * self.kernel_size * sizeof(float));
+        
+        cuda_kernels.optimized_conv2d[blocks_per_grid, threads_per_block, shared_memory_size](
             output, input, self.weight, B, C, H, W, self.kernel_size, self.out_channels, outH, outW
         )
         return output
